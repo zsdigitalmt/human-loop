@@ -1,0 +1,5 @@
+{
+  "name": "human-loop",
+  "owner": { "name": "zsdigitalmt" },
+  "plugins": [{ "name": "human-loop", "source": "./" }]
+}
