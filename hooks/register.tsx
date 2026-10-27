@@ -1,13 +1,21 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
-import type { Bookmark, Need, SessionNeeds } from '../types'
-import { age, askOf, clip, clock, doneOf, kindLabel, liveOthers, markId, marksOf, withNeed, withoutKinds, withoutNeed } from './lib'
+import type { Ask, Bookmark, SessionNeeds, Wait } from '../types'
+import { age, answerText, clip, clock, close, isLive, isStale, liveOthers, nextId, optionAnswer, ordered, parseAsk, prune } from './lib'
 
 const PANE = 'needs-human'
-const needs = atom({ plugin: 'human-loop', key: 'needs' } as const, [])
+const asks = atom({ plugin: 'human-loop', key: 'asks' } as const, [])
+const waits = atom({ plugin: 'human-loop', key: 'waits' } as const, [])
 const others = atom({ plugin: 'human-loop', key: 'others' } as const, [])
 const bookmarks = atom({ plugin: 'human-loop', key: 'bookmarks' } as const, [])
+const expanded = atom({ plugin: 'human-loop', key: 'expanded' } as const, '')
+const typing = atom({ plugin: 'human-loop', key: 'typing' } as const, '')
+
+const ASK_TOOL = 'mcp__human-loop__ask_human'
+const RESOLVE_TOOL = 'mcp__human-loop__resolve_need'
+const WITHDRAW_TOOL = 'mcp__human-loop__withdraw_need'
+const LIST_TOOL = 'mcp__human-loop__list_needs'
 
 type Seen = { id: string; isUser: boolean }
 
@@ -22,6 +30,7 @@ const S = {
   dir: '',
   lastOthers: '',
   flush: null as { cancel: () => void } | null,
+  sending: new Set<string>(),
 }
 
 const now = (): number => Date.now()
@@ -34,23 +43,69 @@ function persistStamps($: EngineInterface): void {
   })
 }
 
-async function writeOwn($: EngineInterface): Promise<void> {
+async function writeOwn($: EngineInterface, live = true): Promise<void> {
   if (!S.dir) return
-  const file: SessionNeeds = { session: S.selfName, sessionId: S.selfId, updatedAt: now(), needs: await read($, needs) }
+  const open = live ? (await read($, asks)).filter(isLive) : []
+  const file: SessionNeeds = { session: S.selfName, sessionId: S.selfId, updatedAt: await $.clock.now(), needs: open }
   await $.fs.write(`${S.dir}/${S.selfId}.json`, JSON.stringify(file))
 }
 
 async function showStatus($: EngineInterface): Promise<void> {
-  const own = (await read($, needs)).length
+  const own = (await read($, asks)).filter(isLive).length + (await read($, waits)).length
   const rest = (await read($, others)).reduce((n, f) => n + f.needs.length, 0)
   const total = own + rest
-  $.ui.status(total === 0 ? '⚑ 0' : `⚑ ${total} need you${rest > 0 ? ` (${rest} other)` : ''} · /needs`)
+  $.ui.status(total === 0 ? 'NH 0' : `NH ${own}${rest > 0 ? ` (+${rest} other)` : ''} · /needs`)
 }
 
-async function changeNeeds($: EngineInterface, fn: (list: readonly Need[]) => Need[]): Promise<void> {
-  await update($, needs, fn)
+async function changeAsks($: EngineInterface, fn: (list: readonly Ask[]) => Ask[]): Promise<void> {
+  const t = await $.clock.now()
+  await update($, asks, list => prune(fn(list), t))
+  await $.store.set(`asks:${S.selfId}`, await read($, asks))
   await writeOwn($)
   await showStatus($)
+}
+
+async function changeWaits($: EngineInterface, fn: (list: readonly Wait[]) => Wait[]): Promise<void> {
+  await update($, waits, fn)
+  await showStatus($)
+}
+
+// The id counter is shared by every session, so ids stay unique across them.
+async function mintId($: EngineInterface): Promise<string> {
+  const ids = [...(await read($, asks)), ...(await read($, others)).flatMap(f => f.needs)]
+    .map(a => Number(/^NH-(\d+)$/.exec(a.id)?.[1] ?? 0))
+  const stored = Number((await $.store.get('nh-seq')) ?? 0)
+  const seq = Math.max(stored, ...ids, 0) + 1
+  await $.store.set('nh-seq', seq)
+  return nextId(seq)
+}
+
+// One press answers: the row goes to `sent` first, so a second press finds
+// nothing open and submits nothing.
+async function answer($: EngineInterface, id: string, text: string): Promise<void> {
+  // Claimed before any await: two presses in the same tick must not both pass.
+  if (S.sending.has(id) || !text.trim()) return
+  S.sending.add(id)
+  try {
+    await send($, id, text)
+  } finally {
+    S.sending.delete(id)
+  }
+}
+
+async function send($: EngineInterface, id: string, text: string): Promise<void> {
+  const ask = (await read($, asks)).find(a => a.id === id)
+  if (!ask || ask.status !== 'open') return
+  await update($, typing, () => '')
+  await changeAsks($, list => list.map(a => (a.id === id ? { ...a, status: 'sent', answer: text } : a)))
+  try {
+    await $.prompt.submit({ text: answerText(ask, text) })
+    const t = await $.clock.now()
+    await changeAsks($, list => close(list, id, 'answered', t, text))
+  } catch {
+    await changeAsks($, list => list.map(a => (a.id === id ? { ...a, status: 'open', answer: undefined } : a)))
+    $.ui.toast(`${id}: could not send, try again`)
+  }
 }
 
 async function pollOthers($: EngineInterface): Promise<void> {
@@ -66,13 +121,13 @@ async function pollOthers($: EngineInterface): Promise<void> {
       // half-written file; next poll gets it
     }
   }
-  const live = liveOthers(files, S.selfId, now())
+  const live = liveOthers(files, S.selfId, await $.clock.now())
   const key = JSON.stringify(live.map(f => [f.sessionId, f.needs.map(n => n.id)]))
   if (key === S.lastOthers) return
   const before = new Set((await read($, others)).flatMap(f => f.needs.map(n => n.id)))
-  const fresh = live.flatMap(f => f.needs.filter(n => !before.has(n.id)).map(n => `${f.session}: ${n.text}`))
+  const fresh = live.flatMap(f => f.needs.filter(n => !before.has(n.id)).map(n => `${f.session} ${n.id}: ${n.question}`))
   const first = fresh[0]
-  if (S.lastOthers !== '' && first) $.ui.toast(`⚑ ${clip(first, 90)}`)
+  if (S.lastOthers !== '' && first) $.ui.toast(`NH ${clip(first, 90)}`)
   S.lastOthers = key
   await update($, others, () => live)
   await showStatus($)
@@ -123,7 +178,7 @@ async function mark($: EngineInterface, label: string): Promise<string> {
   return `★ Bookmarked: ${bm.label}`
 }
 
-function openPane($: EngineInterface) { return $.ui.open({ id: PANE, title: 'Needs you · bookmarks' }) }
+function openPane($: EngineInterface) { return $.ui.open({ id: PANE, title: 'Needs Human' }) }
 
 // Timestamps: first time a row is seen live; rows replayed at start stay unstamped.
 function stampOf($: EngineInterface, id: string, isUser: boolean): number | undefined {
@@ -138,6 +193,88 @@ function stampOf($: EngineInterface, id: string, isUser: boolean): number | unde
 }
 
 
+
+const OPTION_SCHEMA = {
+  type: 'object',
+  properties: {
+    key: { type: 'string', description: 'Short key, e.g. "A". Defaults to A, B, C… by position.' },
+    label: { type: 'string', description: 'The choice in a few words, shown on its button.' },
+    cost: { type: 'string', description: 'What choosing it costs (time, risk), shown when the row is expanded.' },
+  },
+  required: ['label'],
+}
+
+const TOOLS = [
+  {
+    name: 'ask_human',
+    description:
+      'Put a question to your human in the Needs Human pane and keep working. Use it for every decision, approval or missing input you need from them instead of asking in prose. They answer with one click; the answer arrives as their next message, starting "NH-<n> answer:". Give 2-4 options with the recommended one named. Returns the question id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'One line, under ~90 characters: what you need decided.' },
+        options: { type: 'array', items: OPTION_SCHEMA, description: 'The choices. The human can always type another answer.' },
+        recommended: { type: 'string', description: 'The key of the option you recommend.' },
+        context: { type: 'string', description: 'One or two lines shown when the row is expanded.' },
+      },
+      required: ['question', 'options'],
+    },
+  },
+  {
+    name: 'resolve_need',
+    description: 'Close an open Needs Human question the human answered some other way (typed in chat). Sends nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'e.g. NH-4' }, answer: { type: 'string', description: 'What they answered.' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'withdraw_need',
+    description: 'Remove an open Needs Human question that no longer needs the human (resolved, superseded or wrong). Sends nothing.',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+  },
+  {
+    name: 'list_needs',
+    description: 'List this session\'s open Needs Human questions and their ids.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+]
+
+type ToolArgs = Record<string, unknown>
+const argsOf = (e: unknown): ToolArgs => {
+  const r = e as ToolArgs
+  return (r.input && typeof r.input === 'object' ? r.input : r) as ToolArgs
+}
+
+
+// The mod's own tools; served from the one unmatched tool.call hook.
+async function serveTool($: EngineInterface, tool: string, e: unknown): Promise<ToolCallResult | undefined> {
+  if (tool === ASK_TOOL) {
+    const id = await mintId($)
+    const ask = parseAsk(argsOf(e), id, await $.clock.now())
+    if (typeof ask === 'string') return { deny: `ask_human: ${ask}` }
+    await changeAsks($, list => [...list, ask])
+    return { result: `${id} is open in the Needs Human pane. Keep working; the answer arrives as a message starting "${id} answer:".` }
+  }
+  if (tool === RESOLVE_TOOL || tool === WITHDRAW_TOOL) {
+    const status = tool === RESOLVE_TOOL ? 'answered' : 'withdrawn'
+    const args = argsOf(e)
+    const id = typeof args.id === 'string' ? args.id.trim() : ''
+    const found = (await read($, asks)).find(a => a.id === id && isLive(a))
+    if (!found) return { deny: `${id || 'id'} is not an open question in this session` }
+    const said = typeof args.answer === 'string' ? args.answer : undefined
+    const t = await $.clock.now()
+    await changeAsks($, list => close(list, id, status, t, said))
+    return { result: `${id} ${status}.` }
+  }
+  if (tool === LIST_TOOL) {
+    const open = (await read($, asks)).filter(isLive)
+    return { result: open.length ? open.map(a => `${a.id} [${a.status}] ${a.question}`).join('\n') : 'No open questions.' }
+  }
+  return undefined
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     S.startedAt = now()
@@ -151,15 +288,18 @@ export const register: Register = on => {
     for (const [id, at] of Object.entries(saved ?? {})) S.stamps.set(id, at)
     const savedMarks = (await $.store.get(`bookmarks:${S.selfId}`)) as Bookmark[] | undefined
     if (savedMarks && (await read($, bookmarks)).length === 0) await update($, bookmarks, () => savedMarks)
+    const savedAsks = (await $.store.get(`asks:${S.selfId}`)) as Ask[] | undefined
+    const t0 = await $.clock.now()
+    if (savedAsks && (await read($, asks)).length === 0) await update($, asks, () => prune(savedAsks, t0))
+
+    for (const tool of TOOLS) await $.tool.register({ ...tool, isDeferred: false })
 
     for (const [name, description] of [
-      ['needs', 'Open the needs-you / bookmarks pane'],
+      ['needs', 'Open the Needs Human pane'],
       ['bm', 'Bookmark the current message: /bm [label]'],
       ['last', 'Jump to the latest message'],
       ['prev', 'Jump to the previous prompt'],
       ['next', 'Jump to the next prompt'],
-      ['need', 'Flag something as needing a human: /need <text>'],
-      ['needs-clear', "Clear this session's needs"],
     ] as const) {
       // One name taken (a skill, another mod) must not cost the rest of start-up.
       try {
@@ -176,97 +316,63 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Other sessions stop listing this one's questions; they are kept in the store.
   on('session.end', async ($, e, next) => {
-    await update($, needs, () => [])
-    await writeOwn($)
+    await writeOwn($, false)
     return next(e)
   })
 
+
   on('command.run', { command: 'needs' }, async $ => {
     await openPane($)
-    return { text: 'Needs pane opened.' }
+    return { text: 'Needs Human pane opened.' }
   })
   on('command.run', { command: 'bm' }, async ($, e) => ({ text: await mark($, e.args.trim()) }))
   on('command.run', { command: 'last' }, async $ => ({ text: (await jumpLast($)) || '↓ latest' }))
   on('command.run', { command: 'prev' }, async $ => ({ text: (await jumpPrev($)) || '↑ previous prompt' }))
   on('command.run', { command: 'next' }, async $ => ({ text: (await jumpNext($)) || '↓ next prompt' }))
-  on('command.run', { command: 'need' }, async ($, e) => {
-    const text = e.args.trim() || 'needs you'
-    await changeNeeds($, list => withNeed(list, { id: `manual-${now()}`, kind: 'manual', text, at: now(), requestId: S.order[S.order.length - 1]?.id }))
-    return { text: `⚑ Flagged: ${text}` }
-  })
-  on('command.run', { command: 'needs-clear' }, async $ => {
-    await changeNeeds($, () => [])
-    return { text: 'Cleared.' }
-  })
 
-  // The person answered: replies and pending permission asks are settled.
   on('prompt.submit', async ($, e, next) => {
     S.cursor = -1
-    await changeNeeds($, list => withoutKinds(list, ['question', 'permission']))
     return next(e)
   })
 
-  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    const input = e as unknown as { questions?: { question?: string }[] }
-    const text = clip(input.questions?.[0]?.question ?? 'Question for you', 160)
-    const id = `ask-${e.tool_use_id}`
-    await changeNeeds($, list => withNeed(list, { id, kind: 'ask', text, at: now(), requestId: e.tool_use_id }))
-    try {
-      return await next(e)
-    } finally {
-      await changeNeeds($, list => withoutNeed(list, id))
-    }
-  })
-
+  // Engine waits: shown while they last, never sticky.
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
     if (verdict.decision === 'ask' && e.tool_use_id && e.tool !== 'AskUserQuestion') {
       const input = e.input as Record<string, unknown> | null
       const detail = typeof input?.command === 'string' ? input.command : typeof input?.file_path === 'string' ? input.file_path : ''
       const id = `perm-${e.tool_use_id}`
-      await changeNeeds($, list =>
-        withNeed(list, { id, kind: 'permission', text: clip(`${e.tool}${detail ? `: ${detail}` : ''}`, 160), at: now(), requestId: e.tool_use_id }),
-      )
+      const text = clip(`permission: ${e.tool}${detail ? ` ${detail}` : ''}`, 160)
+      const at = await $.clock.now()
+      await changeWaits($, list => [...list.filter(w => w.id !== id), { id, text, at, requestId: e.tool_use_id }])
     }
     return verdict
   })
 
   on('tool.call', async ($, e, next) => {
+    const own = await serveTool($, e.tool, e)
+    if (own) return own
+    // An AskUserQuestion is a wait while it is on screen.
+    const isAsk = e.tool === 'AskUserQuestion'
+    if (isAsk) {
+      const input = argsOf(e) as { questions?: { question?: string }[] }
+      const text = clip(input.questions?.[0]?.question ?? 'Question for you', 160)
+      const id = `perm-${e.tool_use_id}`
+      const at = await $.clock.now()
+      await changeWaits($, list => [...list.filter(w => w.id !== id), { id, text, at, requestId: e.tool_use_id }])
+    }
     try {
       return await next(e)
     } finally {
       const id = `perm-${e.tool_use_id}`
-      if ((await read($, needs)).some(n => n.id === id)) await changeNeeds($, list => withoutNeed(list, id))
+      if ((await read($, waits)).some(w => w.id === id)) await changeWaits($, list => list.filter(w => w.id !== id))
     }
-  })
-
-  on('turn.complete', async ($, e, next) => {
-    const text = typeof e.answer === 'string' ? e.answer : ''
-    const marks = e.reason === 'refusal' ? [] : marksOf(text)
-    const done = doneOf(text)
-    const ask = e.reason === 'refusal' || marks.length > 0 ? null : askOf(text)
-    const lastReply = [...S.order].reverse().find(s => !s.isUser)
-    await changeNeeds($, list => {
-      // Marker flags are sticky: they outlive later prompts until ✓ or [NEEDS-DONE].
-      let kept = withoutKinds(list, ['permission']).filter(
-        n => !(n.kind === 'manual' && done.some(d => n.text.toLowerCase().startsWith(d))),
-      )
-      for (const m of marks) {
-        const id = markId(m)
-        const prior = kept.find(n => n.id === id)
-        kept = withNeed(kept, { id, kind: 'manual', text: m, at: prior?.at ?? now(), requestId: lastReply?.id })
-      }
-      if (!ask) return kept
-      return withNeed(kept, { id: 'reply', kind: 'question', text: ask, at: now(), requestId: lastReply?.id })
-    })
-    return next(e)
   })
 
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
-    if (e.props.origin.kind !== 'composer') {
-      return next(e)
-    }
+    if (e.props.origin.kind !== 'composer') return next(e)
     const at = stampOf($, e.requestId, true)
     const drawn = await next(e)
     if (at === undefined) return drawn
@@ -295,16 +401,16 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const own = await read($, needs)
-    const rest = await read($, others)
-    const count = own.length + rest.reduce((n, f) => n + f.needs.length, 0)
+    const own = (await read($, asks)).filter(isLive).length + (await read($, waits)).length
+    const rest = (await read($, others)).reduce((n, f) => n + f.needs.length, 0)
     // The count lives in the status line; the band shows only when something waits.
-    if (count === 0) return next(e)
+    if (own + rest === 0) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     return (
       <Box>
         <Button key="needs" plain hotkey="n" onPress={() => void openPane($)}>
-          {count > 0 ? <Text color="yellow" bold>⚑ {count} need you</Text> : <Text dimColor>⚑ 0</Text>}
+          <Text color="yellow" bold>NH {own}</Text>
+          {rest > 0 && <Text dimColor> (+{rest} other)</Text>}
         </Button>
         <Text dimColor> · </Text>
         <Button key="prev" plain hotkey="p" label="↑ prev" onPress={() => void jumpPrev($)} />
@@ -319,25 +425,75 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
-    const own = await read($, needs)
+    const els = $.ui.resolve(e)
+    const { Box, Button, Text } = els
+    const Input = 'Input' in els ? els.Input : undefined
+    const live = (await read($, asks)).filter(isLive)
+    const done = (await read($, asks)).filter(a => !isLive(a)).slice(-3).reverse()
+    const engineWaits = await read($, waits)
     const rest = await read($, others)
     const marks = await read($, bookmarks)
-    const width = Math.max(20, (e.props.bodyColumns ?? 60) - 14)
-    const t = now()
+    const open = await read($, expanded)
+    const typingId = await read($, typing)
+    const width = Math.max(20, (e.props.bodyColumns ?? 60) - 12)
+    const t = await $.clock.now()
     return (
       <Box flexDirection="column">
-        <Text bold>This session</Text>
-        {own.length === 0 && <Text dimColor>  nothing waiting on you</Text>}
-        {own.map(n => (
-          <Box key={`own-${n.id}`}>
-            <Button key={`go-${n.id}`} plain onPress={() => (n.requestId ? void scrollTo($, n.requestId) : undefined)}>
-              <Text color="yellow">⚑ </Text>
-              {clip(n.text, width)} <Text dimColor>{kindLabel[n.kind]} · {age(n.at, t)}</Text>
+        <Text bold>Needs Human · {live.length} open</Text>
+        {live.length === 0 && engineWaits.length === 0 && <Text dimColor>  nothing waiting on you</Text>}
+        {engineWaits.map(w => (
+          <Button key={`wait-${w.id}`} plain onPress={() => (w.requestId ? void scrollTo($, w.requestId) : undefined)}>
+            <Text color="yellow">⏳ </Text>
+            {clip(w.text, width)} <Text dimColor>{age(w.at, t)}</Text>
+          </Button>
+        ))}
+        {live.map(a => (
+          <Box key={`ask-${a.id}`} flexDirection="column" marginTop={1}>
+            <Button key={`head-${a.id}`} plain onPress={() => void update($, expanded, cur => (cur === a.id ? '' : a.id))}>
+              <Text color="yellow" bold>{a.id}</Text> {open === a.id ? a.question : clip(a.question, width - 8)}{' '}
+              {isStale(a, t) && <Text color="red">STALE </Text>}
+              <Text dimColor>{age(a.at, t)}</Text>
             </Button>
-            <Text> </Text>
-            <Button key={`done-${n.id}`} plain label="✓" onPress={() => void changeNeeds($, list => withoutNeed(list, n.id))} />
+            {open === a.id && a.context && <Text dimColor>  {a.context}</Text>}
+            {open === a.id &&
+              ordered(a).map(o => (
+                <Text key={`cost-${a.id}-${o.key}`} dimColor>
+                  {'  '}
+                  {o.key === a.recommended ? '★ ' : ''}
+                  {o.key}: {o.label}
+                  {o.cost ? ` (${o.cost})` : ''}
+                </Text>
+              ))}
+            {a.status === 'sent' ? (
+              <Text dimColor>  sent: {clip(a.answer ?? '', width)}</Text>
+            ) : (
+              <Box flexWrap="wrap">
+                {ordered(a).map(o => (
+                  <Box key={`optbox-${a.id}-${o.key}`} marginRight={1}>
+                    <Button key={`opt-${a.id}-${o.key}`} onPress={() => void answer($, a.id, optionAnswer(o))}>
+                      {o.key === a.recommended ? <Text color="green">★ {o.key} {clip(o.label, 28)}</Text> : `${o.key} ${clip(o.label, 28)}`}
+                    </Button>
+                  </Box>
+                ))}
+                <Button key={`other-${a.id}`} plain label="Other…" onPress={() => void update($, typing, cur => (cur === a.id ? '' : a.id))} />
+              </Box>
+            )}
+            {Input && typingId === a.id && a.status === 'open' && (
+              <Input
+                key={`input-${a.id}`}
+                autoFocus
+                placeholder="Type your answer"
+                submitLabel="send"
+                onSubmit={(value: string) => void answer($, a.id, value.trim())}
+              />
+            )}
           </Box>
+        ))}
+        {done.length > 0 && <Text> </Text>}
+        {done.map(a => (
+          <Text key={`done-${a.id}`} dimColor>
+            ✓ {a.id} {clip(a.question, width - 24)} → {a.status === 'withdrawn' ? 'withdrawn' : clip(a.answer ?? '', 18)}
+          </Text>
         ))}
         <Text> </Text>
         <Text bold>Other sessions</Text>
@@ -345,8 +501,7 @@ export const register: Register = on => {
         {rest.flatMap(f =>
           f.needs.map(n => (
             <Text key={`other-${f.sessionId}-${n.id}`}>
-              <Text color="cyan">{clip(f.session, 18)}</Text> {clip(n.text, width - 6)}{' '}
-              <Text dimColor>{kindLabel[n.kind]} · {age(n.at, t)}</Text>
+              <Text color="cyan">{clip(f.session, 16)}</Text> {n.id} {clip(n.question, width - 22)} <Text dimColor>{age(n.at, t)}</Text>
             </Text>
           )),
         )}

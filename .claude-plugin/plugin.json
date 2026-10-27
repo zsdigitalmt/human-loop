@@ -1,1 +1,1 @@
-{ "name": "human-loop", "version": "0.1.0", "description": "Message timestamps, jump-to-message arrows, bookmarks, and a cross-session 'needed from human' inbox", "types": "./types/index.d.ts" }
+{ "name": "human-loop", "version": "0.2.0", "description": "Needs Human (NH): agents ask through a tool, the human answers with one click in a pane, and the row clears. Plus message timestamps, jump-to-message and bookmarks.", "types": "./types/index.d.ts" }

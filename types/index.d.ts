@@ -1,23 +1,36 @@
-export type NeedKind = 'ask' | 'permission' | 'question' | 'manual'
+export type Option = { key: string; label: string; cost?: string }
 
-export type Need = {
+export type AskStatus = 'open' | 'sent' | 'answered' | 'withdrawn'
+
+// A question the agent put to its human through `ask_human`.
+export type Ask = {
   id: string
-  kind: NeedKind
-  text: string
+  question: string
+  options: Option[]
+  recommended?: string
+  context?: string
   at: number
-  requestId?: string
+  status: AskStatus
+  answer?: string
+  closedAt?: number
 }
 
-export type SessionNeeds = { session: string; sessionId: string; updatedAt: number; needs: Need[] }
+// Transient waits the engine raises: a permission prompt or an AskUserQuestion.
+export type Wait = { id: string; text: string; at: number; requestId?: string }
+
+export type SessionNeeds = { session: string; sessionId: string; updatedAt: number; needs: Ask[] }
 
 export type Bookmark = { requestId: string; label: string; at: number }
 
 declare module 'claude-code' {
   interface PluginState {
     'human-loop': {
-      needs: Need[]
+      asks: Ask[]
+      waits: Wait[]
       others: SessionNeeds[]
       bookmarks: Bookmark[]
+      expanded: string
+      typing: string
     }
   }
 }

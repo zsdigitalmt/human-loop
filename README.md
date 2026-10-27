@@ -1,15 +1,20 @@
 # human-loop
 
-A Claude Code mod for running several sessions at once without losing track of what is waiting on you.
+A Claude Code mod that gives the agent one way to ask you something: a **Needs Human** pane. The agent calls a tool, the question shows up as a row with one button per option, and a single click sends your answer back and clears the row. Work carries on while the question waits.
 
-- **Needs pane.** Any line in a reply that starts with `[NEEDS-KEITH]` or `[NEEDS-HUMAN]` becomes a flag in the pane. A flag stays until you tick it or a later reply carries `[NEEDS-DONE] <start of the flag text>`. When a reply has no flags, a closing question is picked up instead.
-- **Cross-session.** Every session writes its needs to `~/.claude/needs-human/<sessionId>.json`, so each pane also counts what other sessions on the same machine are waiting for.
-- **Status line.** Shows `⚑ N need you (M other) · /needs`.
-- **Timestamps and navigation.** Each message gets a timestamp. Jump between prompts and bookmark messages.
+## What you get
+
+- **`ask_human` tool.** The agent asks a one-line question with 2 to 4 options, can mark one as recommended, and can add a cost and a line of context to each. It gets an id back (`NH-<n>`) and keeps working.
+- **Needs Human pane.** Each open question is a row. The recommended option is starred and listed first. **Other…** lets you type an answer instead. A question left open for more than 24 hours is tagged `STALE`.
+- **One click, one answer.** Your pick arrives as your next message, `NH-<n> answer: <option>`, with the question attached so it still makes sense after a compaction. Pressing twice sends nothing more.
+- **Other sessions, read-only.** Open questions from your other Claude Code sessions on the same machine are listed under their session name, so you can see what is waiting elsewhere.
+- **Housekeeping tools.** `resolve_need` closes a question you answered in chat, `withdraw_need` drops one that no longer matters, and `list_needs` lists what is open. None of these sends a prompt.
+- **Status line.** Shows `NH <open> (+<n> other)`.
+- **Navigation extras.** Message timestamps, plus `/bm [label]` to bookmark a message and `/last`, `/prev`, `/next` to jump between prompts.
+
+Commands: `/needs` opens the pane. If another skill or mod already uses a command name, that one command is skipped and the rest still load.
 
 ## Install
-
-At the prompt of a terminal session:
 
 ```
 /plugin install human-loop --marketplace zsdigitalmt/human-loop
@@ -25,14 +30,26 @@ claude plugin install human-loop --marketplace zsdigitalmt/human-loop
 
 In the desktop app, click + next to the prompt box, then Plugins. Choose Add marketplace and enter `zsdigitalmt/human-loop`, then choose Add plugin.
 
-## Commands
+To update an installed copy to the latest version, run `/plugin marketplace update human-loop`.
 
-| Command | What it does |
-|---|---|
-| `/needs` | Open the Needs pane |
-| `/need <text>` | Flag something by hand |
-| `/needs-clear` | Clear this session's needs |
-| `/prev`, `/next`, `/last` | Jump between your prompts |
-| `/bm [label]` | Bookmark the latest message |
+To tell the agent to use it, add a line like this to your `CLAUDE.md`:
 
-To use the band hotkeys, focus the band with ctrl+x tab or a click. Then `n` opens the pane, `p`/`j` go to the previous/next prompt, `l` goes to the latest, and `m` bookmarks.
+> Ask me for any decision, approval or missing input with `mcp__human-loop__ask_human`, not in prose.
+
+## Where it keeps state
+
+- Open and closed questions live in Claude Code's per-mod store. Closed ones are kept for 7 days, then dropped.
+- So other sessions can see them, each session also writes its open questions to `~/.claude/needs-human/<session-id>.json`. Nothing leaves your machine.
+
+## Develop
+
+```
+claude plugin validate .
+claude plugin test .
+```
+
+`GOALS.md` lists the behaviours (G1 to G10) and the test for each one.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).

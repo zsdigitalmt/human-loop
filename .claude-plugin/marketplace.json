@@ -1,5 +1,12 @@
 {
   "name": "human-loop",
-  "owner": { "name": "zsdigitalmt" },
-  "plugins": [{ "name": "human-loop", "source": "./" }]
+  "owner": { "name": "Keith Zammit" },
+  "plugins": [
+    {
+      "name": "human-loop",
+      "source": "./",
+      "description": "Needs Human pane: the agent asks through a tool, you answer with one click.",
+      "version": "0.2.0"
+    }
+  ]
 }
